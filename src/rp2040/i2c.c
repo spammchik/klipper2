@@ -9,6 +9,7 @@
 #include "command.h" // shutdown
 #include "sched.h" // sched_shutdown
 #include "internal.h" // pclock, gpio_peripheral
+#include "i2ccmds.h" // struct i2cdev_s
 #include "hardware/regs/resets.h" // RESETS_RESET_I2C*_BITS
 #include "hardware/structs/i2c.h"
 
@@ -212,4 +213,129 @@ i2c_read(struct i2c_config config, uint8_t reg_len, uint8_t *reg
         i2c_do_write(i2c, config.addr, reg_len, reg, 0, timeout);
     i2c_do_read(i2c, config.addr, read_len, read, timeout);
     i2c_stop(i2c);
+}
+
+static uint_fast8_t
+i2c_async_read(struct timer *timer)
+{
+    struct i2cdev_s *i2c_slv = container_of(timer, struct i2cdev_s, timer);
+    struct i2c_config *config = &i2c_slv->i2c_config;
+    i2c_hw_t *i2c = (i2c_hw_t*)config->i2c;
+
+    if (config->to_read > 0 && i2c->txflr < 16) {
+        int first = config->i == 0;
+        int last = config->to_read == 1;
+        i2c->data_cmd = first << I2C_IC_DATA_CMD_RESTART_LSB
+                        | last << I2C_IC_DATA_CMD_STOP_LSB
+                        | I2C_IC_DATA_CMD_CMD_BITS;
+        config->i++;
+        config->to_read--;
+    }
+
+    if (i2c_slv->data_len[0] > 0 && i2c->rxflr > 0) {
+        i2c_slv->data_len[0]--;
+        i2c_slv->buf[i2c_slv->cur] = i2c->data_cmd & 0xFF;
+        i2c_slv->cur++;
+    }
+
+    if (i2c_slv->data_len[0] == 0) {
+        timer->func = i2c_slv->callback;
+    }
+
+    timer->waketime = timer_read_time() + timer_from_us(10);
+    return SF_RESCHEDULE;
+}
+
+static uint_fast8_t
+i2c_async_read_start(struct timer *timer)
+{
+    struct i2cdev_s *i2c_slv = container_of(timer, struct i2cdev_s, timer);
+    struct i2c_config *config = &i2c_slv->i2c_config;
+
+    config->i = 0;
+    i2c_slv->data_len[0] &= ~(I2C_R);
+    config->to_read = i2c_slv->data_len[0];
+    i2c_slv->cur = i2c_slv->tail;
+    timer->func = i2c_async_read;
+    return i2c_async_read(timer);
+}
+
+static uint_fast8_t
+i2c_async_write_end(struct timer *timer)
+{
+    struct i2cdev_s *i2c_slv = container_of(timer, struct i2cdev_s, timer);
+    struct i2c_config config = i2c_slv->i2c_config;
+    i2c_hw_t *i2c = (i2c_hw_t*)config.i2c;
+    if (i2c_slv->data_len[0] & I2C_R) {
+        return i2c_async_read_start(timer);
+    }
+
+    if (i2c->txflr != 0) {
+        timer->waketime = timer_read_time() + timer_from_us(10);
+        return SF_RESCHEDULE;
+    }
+
+    timer->func = i2c_async;
+    timer->waketime = timer_read_time() + timer_from_us(10);
+    return SF_RESCHEDULE;
+}
+
+static uint_fast8_t
+i2c_async_write(struct timer *timer)
+{
+    struct i2cdev_s *i2c_slv = container_of(timer, struct i2cdev_s, timer);
+    struct i2c_config *config = &i2c_slv->i2c_config;
+    i2c_hw_t *i2c = (i2c_hw_t*)config->i2c;
+    uint8_t byte;
+    int first = config->i == 0;
+    int last = 0;
+
+    // Wait until there's a spot in the TX FIFO
+    if (i2c->txflr == 16) {
+        goto out;
+    }
+
+    byte = i2c_buf_read_b(i2c_slv);
+    i2c_slv->data_len[0]--;
+    config->i++;
+
+    if (i2c_slv->data_len[0] == 0) {
+        last = 1;
+        i2c_cmd_done(i2c_slv);
+        timer->func = i2c_async_write_end;
+    }
+
+    i2c->data_cmd = first << I2C_IC_DATA_CMD_RESTART_LSB |
+                    last << I2C_IC_DATA_CMD_STOP_LSB | byte;
+
+out:
+    timer->waketime = timer_read_time() + timer_from_us(10);
+    return SF_RESCHEDULE;
+}
+
+uint_fast8_t i2c_async(struct timer *timer)
+{
+    struct i2cdev_s *i2c_slv = container_of(timer, struct i2cdev_s, timer);
+    struct i2c_config config = i2c_slv->i2c_config;
+    i2c_hw_t *i2c = (i2c_hw_t*)config.i2c;
+
+    // write register + read
+    if (i2c_slv->data_len[0] || i2c_slv->data_len[1] & I2C_R) {
+        i2c->enable = 0;
+        i2c->tar = i2c_slv->i2c_config.addr;
+        i2c->enable = 1;
+        if (i2c_slv->data_len[0]) {
+            i2c_slv->i2c_config.i = 0;
+            timer->func = i2c_async_write;
+            return i2c_async_write(timer);
+        }
+
+        // cleanup empty write, start read
+        i2c_cmd_done(i2c_slv);
+        return i2c_async_read_start(timer);
+    }
+
+    i2c->enable = 0;
+    i2c_slv->flags &= ~IF_ACTIVE;
+    return SF_DONE;
 }
